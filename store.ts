@@ -209,7 +209,7 @@ export class Store {
   buildTreeFromMap(repo: Repo, files: Map<string, Buffer>): string {
     const buildLevel = (prefix: string): string => {
       const entries: { mode: string; name: string; oid: Buffer }[] = [];
-      const dirs = new Map<string, Map<string, Buffer>>();
+      const dirs = new Set<string>();
       for (const [path, bytes] of files) {
         if (prefix !== '' && !path.startsWith(`${prefix}/`)) continue;
         const rest = prefix === '' ? path : path.slice(prefix.length + 1);
@@ -218,20 +218,13 @@ export class Store {
           const blobOid = this.putObject(repo, 'blob', bytes);
           entries.push({ mode: '100644', name: rest, oid: Buffer.from(blobOid, 'hex') });
         } else {
-          const dir = rest.slice(0, slash);
-          let sub = dirs.get(dir);
-          if (sub === undefined) {
-            sub = new Map();
-            dirs.set(dir, sub);
-          }
-          sub.set(path, bytes);
+          dirs.add(rest.slice(0, slash));
         }
       }
-      for (const [dir, sub] of dirs) {
+      for (const dir of dirs) {
         const subOid = buildLevel(prefix === '' ? dir : `${prefix}/${dir}`);
         entries.push({ mode: '40000', name: dir, oid: Buffer.from(subOid, 'hex') });
       }
-      void subDirsUnused(dirs);
       const data = buildTree(entries);
       return this.putObject(repo, 'tree', data);
     };
@@ -334,8 +327,4 @@ export class Store {
     for (const repo of this.repos.values()) if (repo.id === id) return repo;
     return undefined;
   }
-}
-
-function subDirsUnused(_dirs: Map<string, Map<string, Buffer>>): void {
-  // no-op; keeps the recursive builder's shape obvious.
 }
