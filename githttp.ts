@@ -422,7 +422,7 @@ export function handleReceivePack(store: Store, owner: string, name: string, req
   const needsPack = commands.some((c) => c.newOid !== ZERO_OID);
   if (needsPack) {
     try {
-      const pack = packBuf.length === 0 ? { objects: [] as GitObject[] } : readPack(packBuf);
+      const pack = packBuf.length === 0 ? { objects: [] as GitObject[] } : readPack(packBuf, repo.objects);
       for (const obj of pack.objects) {
         const oid = oidOf(obj.type, obj.data);
         if (!repo.objects.has(oid)) repo.objects.set(oid, obj);

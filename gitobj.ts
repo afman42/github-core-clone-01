@@ -1,6 +1,7 @@
 // gitobj.ts — git object model: loose-object bytes, trees, commits, tags,
-// packfile read/write, reachability. Plain objects only (no deltas on either
-// side); the suite's client never sends deltas and accepts deltaCount 0.
+// packfile read/write, reachability. Pack READING supports OFS_DELTA and
+// REF_DELTA (real git delta-compresses pushes); pack WRITING emits plain
+// objects only (deltaCount 0), which every client accepts.
 import { deflateSync, inflateSync } from 'node:zlib';
 import { hashObject, sha1Hex, ZERO_OID } from './util.ts';
 
@@ -249,8 +250,65 @@ export interface ReadPackResult {
   objects: GitObject[];
 }
 
-/** Read a packfile. Plain objects only; deltas are rejected as corrupt. */
-export function readPack(buf: Buffer): ReadPackResult {
+/** Apply a git delta stream to its base bytes. */
+export function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  let pos = 0;
+  const readVarint = (): number => {
+    let v = 0;
+    let shift = 0;
+    for (;;) {
+      if (pos >= delta.length) throw new Error('delta-varint');
+      const b = delta[pos] as number;
+      pos += 1;
+      v |= (b & 0x7f) << shift;
+      shift += 7;
+      if ((b & 0x80) === 0) return v;
+      if (shift > 56) throw new Error('delta-varint');
+    }
+  };
+  const baseSize = readVarint();
+  const resultSize = readVarint();
+  if (baseSize !== base.length) throw new Error('delta-base-size');
+  const out: Buffer[] = [];
+  let outLen = 0;
+  while (pos < delta.length) {
+    const op = delta[pos] as number;
+    pos += 1;
+    if ((op & 0x80) !== 0) {
+      let offset = 0;
+      let size = 0;
+      if ((op & 0x01) !== 0) { offset = delta[pos] as number; pos += 1; }
+      if ((op & 0x02) !== 0) { offset |= (delta[pos] as number) << 8; pos += 1; }
+      if ((op & 0x04) !== 0) { offset |= (delta[pos] as number) << 16; pos += 1; }
+      if ((op & 0x08) !== 0) { offset |= (delta[pos] as number) << 24; pos += 1; }
+      if ((op & 0x10) !== 0) { size = delta[pos] as number; pos += 1; }
+      if ((op & 0x20) !== 0) { size |= (delta[pos] as number) << 8; pos += 1; }
+      if ((op & 0x40) !== 0) { size |= (delta[pos] as number) << 16; pos += 1; }
+      if (size === 0) size = 0x10000;
+      if (offset + size > base.length) throw new Error('delta-copy-range');
+      out.push(base.subarray(offset, offset + size));
+      outLen += size;
+    } else if (op > 0) {
+      if (pos + op > delta.length) throw new Error('delta-insert-range');
+      out.push(delta.subarray(pos, pos + op));
+      pos += op;
+      outLen += op;
+    } else {
+      throw new Error('delta-op-0');
+    }
+  }
+  const result = Buffer.concat(out, outLen);
+  if (result.length !== resultSize) throw new Error('delta-result-size');
+  return result;
+}
+
+/**
+ * Read a packfile, resolving OFS_DELTA / REF_DELTA chains (including bases
+ * that live in `external`, e.g. objects the server already stores, for thin
+ * packs). Returns the fully-resolved objects; delta results are real objects
+ * whose SHA is content-derived, so storing them verbatim is byte-exact.
+ */
+export function readPack(buf: Buffer, external?: Map<string, GitObject>): ReadPackResult {
   if (buf.length < 32) throw new Error('pack-too-short');
   if (buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack-magic');
   const version = buf.readUInt32BE(4);
@@ -259,10 +317,18 @@ export function readPack(buf: Buffer): ReadPackResult {
   const trailerStart = buf.length - 20;
   const expect = sha1Hex(buf.subarray(0, trailerStart));
   if (buf.subarray(trailerStart).toString('hex') !== expect) throw new Error('pack-checksum');
-  const objects: GitObject[] = [];
+  interface RawEntry {
+    start: number;
+    typeCode: number;
+    data: Buffer; // inflated bytes (delta stream for delta entries)
+    baseOfs?: number; // OFS_DELTA: absolute file offset of the base entry
+    baseOid?: string; // REF_DELTA: oid of the base object
+  }
+  const raw: RawEntry[] = [];
   let off = 12;
   for (let i = 0; i < count; i += 1) {
     if (off >= trailerStart) throw new Error('pack-truncated');
+    const start = off;
     const first = buf[off] as number;
     off += 1;
     const typeCode = (first >> 4) & 0x07;
@@ -277,9 +343,28 @@ export function readPack(buf: Buffer): ReadPackResult {
       shift += 7;
       if (shift > 64) throw new Error('pack-corrupt');
     }
-    const type = CODE_TYPES[typeCode];
-    if (type === undefined) throw new Error('pack-type');
-    if (typeCode === 6 || typeCode === 7) throw new Error('pack-delta-unsupported');
+    if (typeCode !== 1 && typeCode !== 2 && typeCode !== 3 && typeCode !== 4 && typeCode !== 6 && typeCode !== 7) {
+      throw new Error('pack-type');
+    }
+    const entry: RawEntry = { start, typeCode, data: Buffer.alloc(0) };
+    if (typeCode === 6) {
+      // OFS_DELTA: offset varint (base = start - offset).
+      if (off >= trailerStart) throw new Error('pack-truncated');
+      b = buf[off] as number;
+      off += 1;
+      let offset = b & 0x7f;
+      while ((b & 0x80) !== 0) {
+        if (off >= trailerStart) throw new Error('pack-truncated');
+        b = buf[off] as number;
+        off += 1;
+        offset = ((offset + 1) << 7) | (b & 0x7f);
+      }
+      entry.baseOfs = start - offset;
+    } else if (typeCode === 7) {
+      if (off + 20 > trailerStart) throw new Error('pack-truncated');
+      entry.baseOid = buf.subarray(off, off + 20).toString('hex');
+      off += 20;
+    }
     // inflateSync({info:true}) returns {buffer, engine}; engine.bytesWritten
     // is the number of input bytes the zlib stream consumed, so `off` can
     // advance exactly past this entry. Trailing bytes are not consumed.
@@ -290,8 +375,47 @@ export function readPack(buf: Buffer): ReadPackResult {
     const data = Buffer.from(inflated.buffer);
     if (data.length !== size) throw new Error('pack-size');
     off += inflated.engine.bytesWritten;
-    objects.push({ type, data });
+    entry.data = data;
+    raw.push(entry);
   }
   if (off !== trailerStart) throw new Error('pack-trailing');
+  // Resolve: plain objects first, then deltas in dependency order.
+  const byOffset = new Map<number, GitObject>();
+  const byOid = new Map<string, GitObject>();
+  if (external !== undefined) for (const [oid, obj] of external) byOid.set(oid, obj);
+  const objects: GitObject[] = [];
+  const pending: RawEntry[] = [];
+  for (const e of raw) {
+    if (e.typeCode >= 1 && e.typeCode <= 4) {
+      const type = CODE_TYPES[e.typeCode] as ObjType;
+      const obj: GitObject = { type, data: e.data };
+      const oid = oidOf(type, e.data);
+      byOffset.set(e.start, obj);
+      byOid.set(oid, obj);
+      objects.push(obj);
+    } else {
+      pending.push(e);
+    }
+  }
+  let progress = true;
+  while (pending.length > 0 && progress) {
+    progress = false;
+    for (let i = pending.length - 1; i >= 0; i -= 1) {
+      const e = pending[i] as RawEntry;
+      let base: GitObject | undefined;
+      if (e.baseOfs !== undefined) base = byOffset.get(e.baseOfs);
+      else if (e.baseOid !== undefined) base = byOid.get(e.baseOid);
+      if (base === undefined) continue;
+      const result = applyDelta(base.data, e.data);
+      const obj: GitObject = { type: base.type, data: result };
+      const oid = oidOf(base.type, result);
+      byOffset.set(e.start, obj);
+      byOid.set(oid, obj);
+      objects.push(obj);
+      pending.splice(i, 1);
+      progress = true;
+    }
+  }
+  if (pending.length > 0) throw new Error('pack-delta-unresolved');
   return { objects };
 }
