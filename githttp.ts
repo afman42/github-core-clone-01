@@ -39,6 +39,35 @@ export interface GitRes {
 
 const AGENT = 'makefun-forge/1.0';
 
+// The v2 upload-pack advertisement is constant: it names no repo state at
+// all, so one Buffer serves every info/refs v2 request (3 per clone).
+const ADVERT_V2: Buffer = Buffer.concat([
+  pkt('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pkt('version 2\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow filter\n'),
+  pkt('object-format=sha1\n'),
+  pkt(`agent=${AGENT}\n`),
+  PKT_FLUSH,
+]);
+
+/**
+ * Cache for framed responses whose bytes are pure functions of
+ * (repo id, gitVersion, inputs): v0 advertisements and ls-refs replies.
+ * Bounded at 128 entries (clear-and-refill); eviction depends only on
+ * request order, so live and replay still agree.
+ */
+const framedCache = new Map<string, Buffer>();
+const FRAMED_CACHE_MAX = 128;
+function framedGet(key: string): Buffer | undefined {
+  return framedCache.get(key);
+}
+function framedSet(key: string, value: Buffer): void {
+  if (framedCache.size >= FRAMED_CACHE_MAX) framedCache.clear();
+  framedCache.set(key, value);
+}
+
 function header(req: GitReq, name: string): string {
   const v = req.headers[name.toLowerCase()];
   return Array.isArray(v) ? (v[0] ?? '') : (v ?? '');
@@ -84,18 +113,11 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
   if (service === 'git-upload-pack') {
     if (v2) {
       // Smart-HTTP framing: service line, flush, then the v2 advertisement.
-      const body = Buffer.concat([
-        pkt('# service=git-upload-pack\n'),
-        PKT_FLUSH,
-        pkt('version 2\n'),
-        pkt('ls-refs=unborn\n'),
-        pkt('fetch=shallow filter\n'),
-        pkt('object-format=sha1\n'),
-        pkt(`agent=${AGENT}\n`),
-        PKT_FLUSH,
-      ]);
-      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
+      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: ADVERT_V2 };
     }
+    const key = `${repo.id}:${repo.gitVersion}:up`;
+    const hit = framedGet(key);
+    if (hit !== undefined) return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: hit };
     const caps = 'multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow no-done object-format=sha1 ' +
       `symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`;
     const body = Buffer.concat([
@@ -104,9 +126,13 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
       ...refLinesV0(repo, caps),
       PKT_FLUSH,
     ]);
+    framedSet(key, body);
     return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
   }
   if (service === 'git-receive-pack') {
+    const key = `${repo.id}:${repo.gitVersion}:rp`;
+    const hit = framedGet(key);
+    if (hit !== undefined) return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: hit };
     const caps = 'report-status report-status-v2 side-band-64k delete-refs ofs-delta object-format=sha1 ' +
       `symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`;
     const body = Buffer.concat([
@@ -115,6 +141,7 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
       ...refLinesV0(repo, caps),
       PKT_FLUSH,
     ]);
+    framedSet(key, body);
     return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body };
   }
   return jsonRes(400, { message: 'Unknown service' });
@@ -122,6 +149,15 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
 
 // --- ls-refs (v2) -------------------------------------------------------------
 function handleLsRefs(repo: Repo, args: string[]): Buffer {
+  const cacheKey = `${repo.id}:${repo.gitVersion}|ls|${args.join('\u0000')}`;
+  const hit = framedGet(cacheKey);
+  if (hit !== undefined) return hit;
+  const body = buildLsRefs(repo, args);
+  framedSet(cacheKey, body);
+  return body;
+}
+
+function buildLsRefs(repo: Repo, args: string[]): Buffer {
   const wantPeel = args.includes('peel');
   const wantSymrefs = args.includes('symrefs');
   const wantUnborn = args.includes('unborn');
@@ -169,6 +205,14 @@ interface FetchPlan {
   wantedRefs: [string, string][];
   /** The pack bytes for `send` (writePack is deterministic: oid-sorted). */
   pack: Buffer;
+  /**
+   * Fully-framed fetch replies for this plan, keyed
+   * `${proto}|${done}|${haves>0}`. The bytes are a pure function of
+   * (plan, done, haves-present), so a hit is byte-identical to rebuilding
+   * them — and it skips all the pkt/sideband Buffer.concat work per fetch.
+   * Shared with the cache entry, so a hit in a later request reuses it.
+   */
+  responses: Map<string, Buffer>;
 }
 
 /**
@@ -185,6 +229,7 @@ interface CachedFetch {
   newShallow: string[];
   unshallow: string[];
   wantedRefs: [string, string][];
+  responses: Map<string, Buffer>;
 }
 const fetchCache = new Map<string, CachedFetch>();
 const FETCH_CACHE_MAX = 128;
@@ -198,7 +243,7 @@ function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
   const key = fetchCacheKey(repo, args);
   const hit = fetchCache.get(key);
   if (hit !== undefined) {
-    return { send: [], acks: hit.acks, newShallow: hit.newShallow, unshallow: hit.unshallow, wantedRefs: hit.wantedRefs, pack: hit.pack };
+    return { send: [], acks: hit.acks, newShallow: hit.newShallow, unshallow: hit.unshallow, wantedRefs: hit.wantedRefs, pack: hit.pack, responses: hit.responses };
   }
   const store = repo.objects;
   // Resolve tag wants to their target commits for distance purposes.
@@ -293,9 +338,10 @@ function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
     if (obj !== undefined) send.push(obj);
   }
   const pack = writePack(send);
+  const responses = new Map<string, Buffer>();
   if (fetchCache.size >= FETCH_CACHE_MAX) fetchCache.clear();
-  fetchCache.set(key, { pack, acks, newShallow, unshallow, wantedRefs });
-  return { send, acks, newShallow, unshallow, wantedRefs, pack };
+  fetchCache.set(key, { pack, acks, newShallow, unshallow, wantedRefs, responses });
+  return { send, acks, newShallow, unshallow, wantedRefs, pack, responses };
 }
 
 function sidebandPackets(pack: Buffer): Buffer[] {
@@ -314,6 +360,15 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 
 function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
+  const key = `v2|${args.done}|${args.haves.length > 0}`;
+  const cached = plan.responses.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildFetchV2(plan, args);
+  plan.responses.set(key, built);
+  return built;
+}
+
+function buildFetchV2(plan: FetchPlan, args: FetchArgs): Buffer {
   const pack = plan.pack;
   const parts: Buffer[] = [];
   // Response shape, verified byte-for-byte against real git-http-backend:
@@ -351,6 +406,15 @@ function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
 
 function handleFetchV0(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
+  // A v0 reply is a pure function of the plan alone.
+  const cached = plan.responses.get('v0');
+  if (cached !== undefined) return cached;
+  const built = buildFetchV0(plan);
+  plan.responses.set('v0', built);
+  return built;
+}
+
+function buildFetchV0(plan: FetchPlan): Buffer {
   const pack = plan.pack;
   const parts: Buffer[] = [];
   if (plan.acks.length === 0) parts.push(pkt('NAK\n'));
