@@ -485,7 +485,12 @@ export function handleReceivePack(store: Store, owner: string, name: string, req
   const reportBytes = Buffer.concat(report.map((l) => pkt(`${l}\n`)));
   let body: Buffer;
   if (sideband) {
-    body = Buffer.concat([...sidebandPackets(reportBytes), PKT_FLUSH]);
+    // The report lines are a pkt-line stream inside channel 1, so they need
+    // their own terminating flush INSIDE the sideband data (verified against
+    // real git-http-backend: `...\x01` + lines + `0000`, then the outer
+    // flush). Without the inner flush git dies with "the remote end hung
+    // up unexpectedly" right after reading the `ok` line.
+    body = Buffer.concat([...sidebandPackets(Buffer.concat([reportBytes, PKT_FLUSH])), PKT_FLUSH]);
   } else {
     body = Buffer.concat([reportBytes, PKT_FLUSH]);
   }
