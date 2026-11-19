@@ -86,8 +86,10 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
   const v2 = header(req, 'git-protocol').includes('version=2');
   if (service === 'git-upload-pack') {
     if (v2) {
+      // Smart-HTTP framing: service line, flush, then the v2 advertisement.
       const body = Buffer.concat([
         pkt('# service=git-upload-pack\n'),
+        PKT_FLUSH,
         pkt('version 2\n'),
         pkt('ls-refs=unborn\n'),
         pkt('fetch=shallow filter\n'),
@@ -101,6 +103,7 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
       `symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`;
     const body = Buffer.concat([
       pkt('# service=git-upload-pack\n'),
+      PKT_FLUSH,
       ...refLinesV0(repo, caps),
       PKT_FLUSH,
     ]);
@@ -111,6 +114,7 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
       `symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`;
     const body = Buffer.concat([
       pkt('# service=git-receive-pack\n'),
+      PKT_FLUSH,
       ...refLinesV0(repo, caps),
       PKT_FLUSH,
     ]);
