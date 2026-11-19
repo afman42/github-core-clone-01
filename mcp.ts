@@ -206,7 +206,7 @@ function callTool(store: Store, name: string, argsRaw: unknown): { errorCode?: n
   const args: Record<string, unknown> = argsRaw !== null && typeof argsRaw === 'object' && !Array.isArray(argsRaw)
     ? (argsRaw as Record<string, unknown>)
     : {};
-  const missing = (def.inputSchema.required as string[]).filter((req) => {
+  const missing = [...(def.inputSchema.required as readonly string[])].filter((req) => {
     if (req === 'owner' || req === 'repo') {
       const { owner, repo } = ownerRepo(args, store);
       if (req === 'owner') return owner === '';
@@ -230,7 +230,10 @@ function callTool(store: Store, name: string, argsRaw: unknown): { errorCode?: n
       if (store.repoFor(ownerLogin, repoName) !== undefined) {
         return { result: toolError(`Repository ${ownerLogin}/${repoName} already exists.`) };
       }
-      const repo = store.createRepo(ownerLogin, repoName, desc, priv === true, defBranch === '' ? 'main' : defBranch);
+      const repo = store.createRepo(repoName, desc, priv === true, ownerLogin, defBranch === '' ? 'main' : defBranch);
+      if (repo === null) {
+        return { result: toolError(`Repository ${ownerLogin}/${repoName} already exists.`) };
+      }
       return { result: toolResult(repoJson(store, repo)) };
     }
     case 'get_repo': {

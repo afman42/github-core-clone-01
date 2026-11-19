@@ -174,7 +174,7 @@ class Parser {
     }
     let name: string | null = null;
     const n = this.peek();
-    if (n !== undefined && n.kind === 'name') name = this.next().value;
+    if (n !== undefined && n.kind === 'name') name = this.expectName();
     const variables: Record<string, ValueNode> = {};
     if (this.acceptPunct('(')) {
       while (!this.acceptPunct(')')) {

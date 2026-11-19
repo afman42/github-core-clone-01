@@ -298,10 +298,16 @@ function pageParams(query: URLSearchParams): { page: number; perPage: number } {
   return { page, perPage };
 }
 
-function paginate<T>(items: T[], query: URLSearchParams): { page: T[]; hasNext: boolean; page: number; perPage: number } {
+function paginate<T>(items: T[], query: URLSearchParams): { items: T[]; hasNext: boolean; page: number; perPage: number } {
   const { page, perPage } = pageParams(query);
   const start = (page - 1) * perPage;
-  return { page: items.slice(start, start + perPage), hasNext: start + perPage < items.length, page, perPage };
+  return { items: items.slice(start, start + perPage), hasNext: start + perPage < items.length, page, perPage };
+}
+
+/** Absolute `Link: <...>; rel="next"` header when another page exists. */
+function nextLink(ctx: RestCtx, path: string, p: { hasNext: boolean; page: number; perPage: number }): Record<string, string> {
+  if (!p.hasNext) return {};
+  return { link: `<http://${ctx.host}${path}?page=${p.page + 1}&per_page=${p.perPage}>; rel="next"` };
 }
 
 // --- main handler ------------------------------------------------------------------
@@ -334,7 +340,7 @@ export function handleRest(store: Store, ctx: RestCtx): RestRes {
       if (p.hasNext) {
         headers.link = `<http://${ctx.host}/api/v3/user/repos?page=${p.page + 1}&per_page=${p.perPage}>; rel="next"`;
       }
-      return ok(200, p.page.map((r) => repoJson(store, r)), headers);
+      return ok(200, p.items.map((r) => repoJson(store, r)), headers);
     }
     if (m === 'POST') {
       const { value: body, invalid } = parseBody(ctx);
@@ -626,7 +632,7 @@ function handleIssues(store: Store, repo: Repo, ctx: RestCtx, rest: string[]): R
         list.sort((a, b) => b.seq - a.seq);
       }
       const p = paginate(list, ctx.query);
-      return ok(200, p.page.map((i) => issueJson(store, repo, i)));
+      return ok(200, p.items.map((i) => issueJson(store, repo, i)), nextLink(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues`, p));
     }
     return err(404, 'Not Found');
   }
@@ -688,7 +694,7 @@ function handlePulls(store: Store, repo: Repo, ctx: RestCtx, rest: string[]): Re
       else if (state === 'closed') list = list.filter((p) => p.state === 'closed');
       list.sort((a, b) => b.seq - a.seq);
       const p = paginate(list, ctx.query);
-      return ok(200, p.page.map((pr) => pullJson(store, repo, pr)));
+      return ok(200, p.items.map((pr) => pullJson(store, repo, pr)), nextLink(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/pulls`, p));
     }
     return err(404, 'Not Found');
   }

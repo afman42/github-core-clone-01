@@ -380,7 +380,7 @@ export function handleReceivePack(store: Store, owner: string, name: string, req
   const repo = lookupRepo(store, owner, name);
   if (repo === null) return jsonRes(404, { message: 'Not Found' });
   let commands: PushCommand[] = [];
-  let packBuf = Buffer.alloc(0);
+  let packBuf: Buffer = Buffer.alloc(0);
   let sideband = false;
   try {
     const [cmdLines, rest] = splitAtFlush(req.body);
