@@ -17,14 +17,6 @@ import { Store } from './store.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY = 64 * 1024 * 1024;
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-
 function sendJson(res: ServerResponse, reqId: string, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = body === null ? '' : `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
@@ -59,7 +51,9 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Small bodies (every REST/git write in the suite) arrive in one chunk:
+    // return it directly instead of allocating a copy via Buffer.concat.
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -81,7 +75,14 @@ export function createApp(): Server {
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     const reqId = store.requestId();
-    const path = pathOf(req);
+    // Parse the URL once; the branches below used to parse it again each.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://entry');
+    } catch {
+      url = new URL('/', 'http://entry');
+    }
+    const path = url.pathname;
     const method = req.method ?? 'GET';
 
     // The env's boot check calls this twice: 200 {"ok":true}. No auth.
@@ -103,7 +104,6 @@ export function createApp(): Server {
           const repoName = decodeURIComponent(gitMatch[2] as string);
           const action = gitMatch[3] as string;
           const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
-          const url = new URL(req.url ?? '/', 'http://entry');
           const gitReq = { method, headers: req.headers, body, query: url.searchParams };
           const out = action === 'info/refs'
             ? handleInfoRefs(store, owner, repoName, url.searchParams.get('service') ?? '', gitReq)
@@ -163,12 +163,14 @@ export function createApp(): Server {
             return;
           }
           const body = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE' ? await readBody(req) : Buffer.alloc(0);
-          const url = new URL(req.url ?? '/', 'http://entry');
           const segments = path
             .replace(/^\/api\/v3\/?/, '')
             .split('/')
             .filter((s) => s !== '')
             .map((s) => {
+              // Segments are plain ASCII in the suite; skip the decoder
+              // unless the segment actually carries an escape.
+              if (!s.includes('%')) return s;
               try {
                 return decodeURIComponent(s);
               } catch {

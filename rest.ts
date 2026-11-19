@@ -70,6 +70,8 @@ export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
 }
 
 function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unknown> {
+  // created_at, updated_at (and closed_at) all derive from the same seq.
+  const at = isoOfSeq(issue.seq);
   return {
     id: issue.id,
     node_id: store.issueGlobalId(repo, issue),
@@ -82,9 +84,9 @@ function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unkno
       return { name, color: l?.color ?? 'ededed', description: l?.description ?? '' };
     }),
     user: { login: repo.owner, id: 1000, type: 'User' },
-    created_at: isoOfSeq(issue.seq),
-    updated_at: isoOfSeq(issue.seq),
-    closed_at: issue.state === 'closed' ? isoOfSeq(issue.seq) : null,
+    created_at: at,
+    updated_at: at,
+    closed_at: issue.state === 'closed' ? at : null,
     comments: issue.comments.length,
   };
 }
@@ -115,6 +117,8 @@ function commitJson(store: Store, repo: Repo, sha: string): Record<string, unkno
 }
 
 function pullJson(store: Store, repo: Repo, pr: Pull): Record<string, unknown> {
+  // created_at, updated_at (and closed_at) all derive from the same seq.
+  const at = isoOfSeq(pr.seq);
   return {
     id: pr.id,
     node_id: store.pullGlobalId(repo, pr),
@@ -129,9 +133,9 @@ function pullJson(store: Store, repo: Repo, pr: Pull): Record<string, unknown> {
     merge_commit_sha: pr.merged ? pr.mergeCommitSha : null,
     mergeable: pr.merged ? false : !mergeConflicts(store, repo, pr),
     draft: false,
-    created_at: isoOfSeq(pr.seq),
-    updated_at: isoOfSeq(pr.seq),
-    closed_at: pr.state === 'closed' ? isoOfSeq(pr.seq) : null,
+    created_at: at,
+    updated_at: at,
+    closed_at: pr.state === 'closed' ? at : null,
   };
 }
 
