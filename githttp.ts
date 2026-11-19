@@ -3,6 +3,7 @@
 // Plain objects only in packs (no deltas); object bytes are stored verbatim.
 import {
   collectReachable,
+  collectReachableBounded,
   commitDistances,
   isAncestor,
   oidOf,
@@ -229,10 +230,13 @@ function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
     sendOids.add(oid);
     collectTree(parseCommit(obj.data).tree);
   }
-  // Subtract what the client already holds.
+  // Subtract what the client already holds. A have that is a shallow
+  // boundary is held WITHOUT its parents, so the subtraction must stop at
+  // the boundary (collectReachableBounded) — a full closure would subtract
+  // the very ancestors a deepen is supposed to deliver.
   let haveClosure = new Set<string>();
   try {
-    haveClosure = collectReachable(store, args.haves);
+    haveClosure = collectReachableBounded(store, args.haves, new Set(args.shallow));
   } catch {
     haveClosure = new Set<string>();
   }

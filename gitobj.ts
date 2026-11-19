@@ -150,6 +150,37 @@ export function collectReachable(store: ObjectStore, roots: string[]): Set<strin
   return seen;
 }
 
+/**
+ * Reachable oids from roots, but commits in `shallow` are leaves: their own
+ * tree (and blobs) are included, their parents are not. A shallow clone
+ * holds its boundary commit without that commit's history, so a have that
+ * is a shallow boundary must not subtract its ancestors from a fetch —
+ * otherwise a deepen could never deliver the parent (fetch-shallow-deepen).
+ */
+export function collectReachableBounded(store: ObjectStore, roots: string[], shallow: ReadonlySet<string>): Set<string> {
+  const seen = new Set<string>();
+  const stack: string[] = [...roots];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid) || oid === ZERO_OID) continue;
+    const obj = store.get(oid);
+    if (obj === undefined) throw new Error(`missing-object ${oid}`);
+    seen.add(oid);
+    if (obj.type === 'commit') {
+      const c = parseCommit(obj.data);
+      stack.push(c.tree);
+      if (!shallow.has(oid)) for (const p of c.parents) stack.push(p);
+    } else if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+    } else if (obj.type === 'tree') {
+      for (const e of parseTree(obj.data)) {
+        if (e.mode !== '160000') stack.push(e.oid.toString('hex'));
+      }
+    }
+  }
+  return seen;
+}
+
 /** True when `ancestor` is reachable from `tip` (or equal). */
 export function isAncestor(store: ObjectStore, ancestor: string, tip: string): boolean {
   if (ancestor === tip) return true;
