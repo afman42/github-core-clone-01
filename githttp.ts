@@ -159,6 +159,8 @@ interface FetchArgs {
   haves: string[];
   shallow: string[];
   depth: number | null;
+  /** Client sent `done`: negotiation is over, send the packfile at once. */
+  done: boolean;
 }
 
 interface FetchPlan {
@@ -281,19 +283,33 @@ function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
   const pack = writePack(plan.send);
   const parts: Buffer[] = [];
-  parts.push(pkt('acknowledgments\n'));
-  if (plan.acks.length === 0) parts.push(pkt('NAK\n'));
-  else for (const a of plan.acks) parts.push(pkt(`ACK ${a}\n`));
-  parts.push(PKT_DELIM);
-  if (plan.newShallow.length > 0 || plan.unshallow.length > 0) {
-    parts.push(pkt('shallow-info\n'));
-    for (const s of plan.newShallow) parts.push(pkt(`shallow ${s}\n`));
-    for (const u of plan.unshallow) parts.push(pkt(`unshallow ${u}\n`));
+  // Response shape, verified byte-for-byte against real git-http-backend:
+  // - `done` (or no haves at all): NO acknowledgments section; the reply
+  //   starts with [shallow-info] then `packfile`.
+  // - haves but no `done`: an acknowledgments section first. When at least
+  //   one have is an ancestor of a want, the server ACKs, says `ready`, and
+  //   still sends the packfile in the same reply. When nothing is ACKed it
+  //   answers NAK + flush only, and the client sends another round (with
+  //   `done`). Sending an acknowledgments section after `done` makes real
+  //   git die with "expected 'packfile', received 'acknowledgments'".
+  if (!args.done && args.haves.length > 0) {
+    parts.push(pkt('acknowledgments\n'));
+    if (plan.acks.length === 0) {
+      parts.push(pkt('NAK\n'));
+      parts.push(PKT_FLUSH);
+      return Buffer.concat(parts);
+    }
+    for (const a of plan.acks) parts.push(pkt(`ACK ${a}\n`));
+    parts.push(pkt('ready\n'));
     parts.push(PKT_DELIM);
   }
-  // Note: no `wanted-refs` section. Git's client only consumes it after a
-  // `want-ref` request, and sending it after plain `want` oids makes real
-  // git reject the response ("expected 'packfile'").
+  if (plan.newShallow.length > 0 || plan.unshallow.length > 0) {
+    parts.push(pkt('shallow-info\n'));
+    // Reference sends shallow/unshallow lines with no trailing LF.
+    for (const s of plan.newShallow) parts.push(pkt(`shallow ${s}`));
+    for (const u of plan.unshallow) parts.push(pkt(`unshallow ${u}`));
+    parts.push(PKT_DELIM);
+  }
   parts.push(pkt('packfile\n'));
   parts.push(...sidebandPackets(pack));
   parts.push(PKT_FLUSH);
@@ -336,15 +352,13 @@ export function handleUploadPack(store: Store, owner: string, name: string, req:
         return { status: 200, contentType: 'application/x-git-upload-pack-result', body: handleLsRefs(repo, args) };
       }
       if (command === 'fetch') {
-        const fetchArgs: FetchArgs = { wants: [], haves: [], shallow: [], depth: null };
+        const fetchArgs: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, done: false };
         for (const a of args) {
           if (a.startsWith('want ')) fetchArgs.wants.push(a.slice(5).trim());
           else if (a.startsWith('have ')) fetchArgs.haves.push(a.slice(5).trim());
           else if (a.startsWith('shallow ')) fetchArgs.shallow.push(a.slice(8).trim());
           else if (a.startsWith('deepen ')) fetchArgs.depth = parseInt(a.slice(7).trim(), 10);
-        }
-        if (fetchArgs.wants.length === 0) {
-          return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat([pkt('acknowledgments\n'), pkt('NAK\n'), PKT_DELIM, pkt('packfile\n'), ...sidebandPackets(writePack([])), PKT_FLUSH]) };
+          else if (a === 'done') fetchArgs.done = true;
         }
         return { status: 200, contentType: 'application/x-git-upload-pack-result', body: handleFetchV2(repo, fetchArgs) };
       }
@@ -354,7 +368,7 @@ export function handleUploadPack(store: Store, owner: string, name: string, req:
       // Protocol v0: two flush-separated sections.
       const [sec1, rest] = splitAtFlush(req.body);
       const [sec2] = splitAtFlush(rest);
-      const fetchArgs: FetchArgs = { wants: [], haves: [], shallow: [], depth: null };
+      const fetchArgs: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, done: false };
       for (const t of pktTextLines(sec1)) {
         if (t.startsWith('want ')) fetchArgs.wants.push(t.slice(5).split(' ')[0] as string);
         else if (t.startsWith('shallow ')) fetchArgs.shallow.push(t.slice(8).trim());
@@ -362,6 +376,7 @@ export function handleUploadPack(store: Store, owner: string, name: string, req:
       }
       for (const t of pktTextLines(sec2)) {
         if (t.startsWith('have ')) fetchArgs.haves.push(t.slice(5).trim());
+        else if (t === 'done') fetchArgs.done = true;
       }
       return { status: 200, contentType: 'application/x-git-upload-pack-result', body: handleFetchV0(repo, fetchArgs) };
     }
