@@ -128,15 +128,17 @@ export class Store {
   }
 
   // --- repos ------------------------------------------------------------------
-  createRepo(name: string, description: string, isPrivate: boolean): Repo | null {
+  createRepo(name: string, description: string, isPrivate: boolean, owner?: string, defaultBranch?: string): Repo | null {
     if (this.repos.has(name)) return null;
+    const ownerLogin = owner !== undefined && owner !== '' ? owner : this.viewerLogin();
+    if (owner !== undefined && owner !== '') this.noteOwner(owner);
     const repo: Repo = {
       id: this.repoIdCounter,
       name,
-      owner: this.viewerLogin(),
+      owner: ownerLogin,
       description,
       private: isPrivate,
-      defaultBranch: 'main',
+      defaultBranch: defaultBranch !== undefined && defaultBranch !== '' ? defaultBranch : 'main',
       objects: new Map(),
       refs: new Map(),
       labels: new Map(),

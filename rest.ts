@@ -158,7 +158,7 @@ function countLines(bytes: Buffer): number {
 }
 
 /** True when a three-way merge of this PR would conflict. */
-function mergeConflicts(store: Store, repo: Repo, pr: Pull): boolean {
+export function mergeConflicts(store: Store, repo: Repo, pr: Pull): boolean {
   const baseTip = store.branchTip(repo, pr.baseRef);
   const headTip = store.branchTip(repo, pr.headRef);
   if (baseTip === undefined || headTip === undefined) return false;
@@ -185,7 +185,7 @@ function mergeConflicts(store: Store, repo: Repo, pr: Pull): boolean {
   return false;
 }
 
-function doSquashMerge(store: Store, repo: Repo, pr: Pull): { sha: string } | null {
+export function doSquashMerge(store: Store, repo: Repo, pr: Pull): { sha: string } | null {
   if (mergeConflicts(store, repo, pr)) return null;
   const baseTip = store.branchTip(repo, pr.baseRef) as string;
   const headTip = store.branchTip(repo, pr.headRef) as string;
@@ -214,6 +214,81 @@ function doSquashMerge(store: Store, repo: Repo, pr: Pull): { sha: string } | nu
   pr.mergedAt = store.isoNow();
   pr.mergeCommitSha = sha;
   return { sha };
+}
+
+/** Files changed between a PR's base and head branches (live diff). */
+export function pullFiles(store: Store, repo: Repo, pr: Pull): { filename: string; status: string; additions: number; deletions: number; changes: number }[] {
+  const baseTip = store.branchTip(repo, pr.baseRef);
+  const headTip = store.branchTip(repo, pr.headRef);
+  if (baseTip === undefined || headTip === undefined) return [];
+  const baseObj = repo.objects.get(baseTip);
+  const headObj = repo.objects.get(headTip);
+  if (baseObj === undefined || headObj === undefined || baseObj.type !== 'commit' || headObj.type !== 'commit') return [];
+  const baseFiles = store.flattenTree(repo, parseCommit(baseObj.data).tree);
+  const headFiles = store.flattenTree(repo, parseCommit(headObj.data).tree);
+  const { changed, deleted } = diffFiles(baseFiles, headFiles);
+  const out: { filename: string; status: string; additions: number; deletions: number; changes: number }[] = [];
+  for (const [path, bytes] of changed) {
+    const old = baseFiles.get(path);
+    const status = old === undefined ? 'added' : 'modified';
+    const additions = countLines(bytes);
+    const deletions = old === undefined ? 0 : countLines(old);
+    out.push({ filename: path, status, additions, deletions, changes: additions + deletions });
+  }
+  for (const path of deleted) {
+    const old = baseFiles.get(path) as Buffer;
+    const deletions = countLines(old);
+    out.push({ filename: path, status: 'removed', additions: 0, deletions, changes: deletions });
+  }
+  out.sort((a, b) => (a.filename < b.filename ? -1 : 1));
+  return out;
+}
+
+export function createIssueRecord(store: Store, repo: Repo, title: string, body: string, labels: string[]): Issue {
+  const number = repo.issueCounter + 1;
+  repo.issueCounter = number;
+  store.tick();
+  const issue: Issue = {
+    id: repo.id * 2000000 + number,
+    number,
+    title,
+    body,
+    state: 'open',
+    labels,
+    comments: [],
+    seq: store.seq,
+  };
+  repo.issues.set(number, issue);
+  return issue;
+}
+
+export function createPullRecord(store: Store, repo: Repo, head: string, base: string, title: string, body: string): Pull | null {
+  const headSha = store.branchTip(repo, head);
+  const baseSha = store.branchTip(repo, base);
+  if (headSha === undefined || baseSha === undefined) return null;
+  const baseObj = repo.objects.get(baseSha);
+  if (baseObj === undefined || baseObj.type !== 'commit') return null;
+  const number = repo.pullCounter + 1;
+  repo.pullCounter = number;
+  store.tick();
+  const pr: Pull = {
+    id: repo.id * 2000000 + 1000000 + number,
+    number,
+    title,
+    body,
+    state: 'open',
+    headRef: head,
+    baseRef: base,
+    headSha,
+    baseSha,
+    baseTreeOid: parseCommit(baseObj.data).tree,
+    merged: false,
+    mergedAt: '',
+    mergeCommitSha: '',
+    seq: store.seq,
+  };
+  repo.pulls.set(number, pr);
+  return pr;
 }
 
 // --- pagination ------------------------------------------------------------------
@@ -267,7 +342,8 @@ export function handleRest(store: Store, ctx: RestCtx): RestRes {
       const name = str(body?.name);
       if (name === '') return err(422, 'name is required');
       if (store.repos.has(name)) return err(422, 'Repository already exists');
-      const repo = store.createRepo(name, str(body?.description), bool(body?.private, false));
+      const defBranch = str(body?.default_branch);
+      const repo = store.createRepo(name, str(body?.description), bool(body?.private, false), undefined, defBranch === '' ? undefined : defBranch);
       if (repo === null) return err(422, 'Repository already exists');
       return ok(201, repoJson(store, repo));
     }
@@ -534,20 +610,7 @@ function handleIssues(store: Store, repo: Repo, ctx: RestCtx, rest: string[]): R
       if (title === '') return err(422, 'title is required');
       const labels = Array.isArray(body?.labels) ? (body.labels as unknown[]).filter((l): l is string => typeof l === 'string') : [];
       for (const l of labels) if (!repo.labels.has(l)) return err(422, `Label does not exist: ${l}`);
-      const number = repo.issueCounter + 1;
-      repo.issueCounter = number;
-      store.tick();
-      const issue: Issue = {
-        id: repo.id * 2000000 + number,
-        number,
-        title,
-        body: str(body?.body),
-        state: 'open',
-        labels,
-        comments: [],
-        seq: store.seq,
-      };
-      repo.issues.set(number, issue);
+      const issue = createIssueRecord(store, repo, title, str(body?.body), labels);
       return ok(201, issueJson(store, repo, issue));
     }
     if (m === 'GET') {
@@ -614,31 +677,8 @@ function handlePulls(store: Store, repo: Repo, ctx: RestCtx, rest: string[]): Re
       if (invalid) return err(400, 'Malformed JSON body');
       const head = str(body?.head);
       const base = str(body?.base);
-      const headSha = store.branchTip(repo, head);
-      const baseSha = store.branchTip(repo, base);
-      if (headSha === undefined || baseSha === undefined) return err(404, 'Head or base branch not found');
-      const baseObj = repo.objects.get(baseSha);
-      if (baseObj === undefined || baseObj.type !== 'commit') return err(404, 'Base branch not found');
-      const number = repo.pullCounter + 1;
-      repo.pullCounter = number;
-      store.tick();
-      const pr: Pull = {
-        id: repo.id * 2000000 + 1000000 + number,
-        number,
-        title: str(body?.title),
-        body: str(body?.body),
-        state: 'open',
-        headRef: head,
-        baseRef: base,
-        headSha,
-        baseSha,
-        baseTreeOid: parseCommit(baseObj.data).tree,
-        merged: false,
-        mergedAt: '',
-        mergeCommitSha: '',
-        seq: store.seq,
-      };
-      repo.pulls.set(number, pr);
+      const pr = createPullRecord(store, repo, head, base, str(body?.title), str(body?.body));
+      if (pr === null) return err(404, 'Head or base branch not found');
       return ok(201, pullJson(store, repo, pr));
     }
     if (m === 'GET') {
@@ -662,30 +702,7 @@ function handlePulls(store: Store, repo: Repo, ctx: RestCtx, rest: string[]): Re
   }
   if (rest[1] === 'files' && m === 'GET') {
     if (pr === undefined) return err(404, 'Not Found');
-    const baseTip = store.branchTip(repo, pr.baseRef);
-    const headTip = store.branchTip(repo, pr.headRef);
-    if (baseTip === undefined || headTip === undefined) return ok(200, []);
-    const baseObj = repo.objects.get(baseTip);
-    const headObj = repo.objects.get(headTip);
-    if (baseObj === undefined || headObj === undefined || baseObj.type !== 'commit' || headObj.type !== 'commit') return ok(200, []);
-    const baseFiles = store.flattenTree(repo, parseCommit(baseObj.data).tree);
-    const headFiles = store.flattenTree(repo, parseCommit(headObj.data).tree);
-    const { changed, deleted } = diffFiles(baseFiles, headFiles);
-    const out: unknown[] = [];
-    for (const [path, bytes] of changed) {
-      const old = baseFiles.get(path);
-      const status = old === undefined ? 'added' : 'modified';
-      const additions = countLines(bytes);
-      const deletions = old === undefined ? 0 : countLines(old);
-      out.push({ filename: path, status, additions, deletions, changes: additions + deletions });
-    }
-    for (const path of deleted) {
-      const old = baseFiles.get(path) as Buffer;
-      const deletions = countLines(old);
-      out.push({ filename: path, status: 'removed', additions: 0, deletions, changes: deletions });
-    }
-    out.sort((a, b) => ((a as { filename: string }).filename < (b as { filename: string }).filename ? -1 : 1));
-    return ok(200, out);
+    return ok(200, pullFiles(store, repo, pr));
   }
   if (rest[1] === 'merge' && m === 'PUT') {
     if (pr === undefined) return err(404, 'Not Found');
