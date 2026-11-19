@@ -444,6 +444,7 @@ export function handleRest(store: Store, ctx: RestCtx): RestRes {
       if (!isOid(sha) || repo.objects.get(sha) === undefined) return err(404, 'Not Found');
       if (repo.refs.has(ref)) return err(422, 'Reference already exists');
       repo.refs.set(ref, sha);
+      repo.gitVersion += 1;
       return ok(201, { ref, object: { sha }, sha, commit: { sha } });
     }
     if (m === 'GET' && rest.length === 2) {

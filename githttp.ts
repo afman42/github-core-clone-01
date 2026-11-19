@@ -167,9 +167,39 @@ interface FetchPlan {
   newShallow: string[];
   unshallow: string[];
   wantedRefs: [string, string][];
+  /** The pack bytes for `send` (writePack is deterministic: oid-sorted). */
+  pack: Buffer;
+}
+
+/**
+ * Fetch-plan cache: the clone workload is 50 concurrent depth-1 clones of
+ * the same repo, whose pack bytes are identical every time. Keyed on the
+ * repo id + gitVersion (bumped on every objects/refs mutation) + the exact
+ * fetch inputs, so a hit is byte-identical to a recomputation. Bounded at
+ * 128 entries (clear-and-refill); eviction depends only on request order,
+ * so live and replay still agree.
+ */
+interface CachedFetch {
+  pack: Buffer;
+  acks: string[];
+  newShallow: string[];
+  unshallow: string[];
+  wantedRefs: [string, string][];
+}
+const fetchCache = new Map<string, CachedFetch>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchCacheKey(repo: Repo, args: FetchArgs): string {
+  const sorted = (xs: string[]): string => xs.slice().sort().join(',');
+  return `${repo.id}:${repo.gitVersion}|${sorted(args.wants)}|${sorted(args.haves)}|${sorted(args.shallow)}|${args.depth === null ? '' : args.depth}`;
 }
 
 function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
+  const key = fetchCacheKey(repo, args);
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) {
+    return { send: [], acks: hit.acks, newShallow: hit.newShallow, unshallow: hit.unshallow, wantedRefs: hit.wantedRefs, pack: hit.pack };
+  }
   const store = repo.objects;
   // Resolve tag wants to their target commits for distance purposes.
   const wantCommits: string[] = [];
@@ -262,7 +292,10 @@ function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
     const obj = store.get(oid);
     if (obj !== undefined) send.push(obj);
   }
-  return { send, acks, newShallow, unshallow, wantedRefs };
+  const pack = writePack(send);
+  if (fetchCache.size >= FETCH_CACHE_MAX) fetchCache.clear();
+  fetchCache.set(key, { pack, acks, newShallow, unshallow, wantedRefs });
+  return { send, acks, newShallow, unshallow, wantedRefs, pack };
 }
 
 function sidebandPackets(pack: Buffer): Buffer[] {
@@ -281,7 +314,7 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 
 function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
-  const pack = writePack(plan.send);
+  const pack = plan.pack;
   const parts: Buffer[] = [];
   // Response shape, verified byte-for-byte against real git-http-backend:
   // - `done` (or no haves at all): NO acknowledgments section; the reply
@@ -318,7 +351,7 @@ function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
 
 function handleFetchV0(repo: Repo, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
-  const pack = writePack(plan.send);
+  const pack = plan.pack;
   const parts: Buffer[] = [];
   if (plan.acks.length === 0) parts.push(pkt('NAK\n'));
   else for (const a of plan.acks) parts.push(pkt(`ACK ${a}\n`));
@@ -420,12 +453,17 @@ export function handleReceivePack(store: Store, owner: string, name: string, req
   let unpackOk = true;
   let unpackDetail = '';
   const needsPack = commands.some((c) => c.newOid !== ZERO_OID);
+  // Any object/ref change invalidates the fetch-pack cache (gitVersion).
+  let changed = false;
   if (needsPack) {
     try {
       const pack = packBuf.length === 0 ? { objects: [] as GitObject[] } : readPack(packBuf, repo.objects);
       for (const obj of pack.objects) {
         const oid = oidOf(obj.type, obj.data);
-        if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
+        if (!repo.objects.has(oid)) {
+          repo.objects.set(oid, obj);
+          changed = true;
+        }
       }
     } catch (err) {
       unpackOk = false;
@@ -449,6 +487,7 @@ export function handleReceivePack(store: Store, owner: string, name: string, req
       else if (cmd.oldOid !== current) report.push(`ng ${cmd.ref} old value mismatch`);
       else {
         repo.refs.delete(cmd.ref);
+        changed = true;
         report.push(`ok ${cmd.ref}`);
       }
       continue;
@@ -461,6 +500,7 @@ export function handleReceivePack(store: Store, owner: string, name: string, req
         report.push(`ng ${cmd.ref} missing object`);
       } else {
         repo.refs.set(cmd.ref, cmd.newOid);
+        changed = true;
         report.push(`ok ${cmd.ref}`);
       }
       continue;
@@ -474,14 +514,17 @@ export function handleReceivePack(store: Store, owner: string, name: string, req
       report.push(`ok ${cmd.ref}`);
     } else if (cmd.ref.startsWith('refs/tags/')) {
       repo.refs.set(cmd.ref, cmd.newOid);
+      changed = true;
       report.push(`ok ${cmd.ref}`);
     } else if (!isAncestor(repo.objects, cmd.oldOid, cmd.newOid)) {
       report.push(`ng ${cmd.ref} non-fast-forward`);
     } else {
       repo.refs.set(cmd.ref, cmd.newOid);
+      changed = true;
       report.push(`ok ${cmd.ref}`);
     }
   }
+  if (changed) repo.gitVersion += 1;
   const reportBytes = Buffer.concat(report.map((l) => pkt(`${l}\n`)));
   let body: Buffer;
   if (sideband) {

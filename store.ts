@@ -72,6 +72,8 @@ export interface Repo {
   pullCounter: number;
   commentCounter: number;
   seq: number;
+  /** Bumped on every change to objects/refs; fetch-pack cache keys on it. */
+  gitVersion: number;
 }
 
 export const LOGICAL_EPOCH = 1700000000;
@@ -148,6 +150,7 @@ export class Store {
       pullCounter: 0,
       commentCounter: 0,
       seq: 0,
+      gitVersion: 0,
     };
     this.repoIdCounter += 1;
     this.repos.set(name, repo);
@@ -173,7 +176,10 @@ export class Store {
   // --- git objects -------------------------------------------------------------
   putObject(repo: Repo, type: ObjType, data: Buffer): string {
     const oid = oidOf(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data });
+      repo.gitVersion += 1;
+    }
     return oid;
   }
   getObject(repo: Repo, oid: string): GitObject | undefined {
@@ -184,7 +190,10 @@ export class Store {
     return repo.refs.get(`refs/heads/${branch}`);
   }
   setBranch(repo: Repo, branch: string, oid: string): void {
-    repo.refs.set(`refs/heads/${branch}`, oid);
+    if (repo.refs.get(`refs/heads/${branch}`) !== oid) {
+      repo.refs.set(`refs/heads/${branch}`, oid);
+      repo.gitVersion += 1;
+    }
   }
 
   /** Flatten a commit's tree into path -> blob bytes. */
