@@ -274,6 +274,7 @@ export class Store {
     });
     const commitSha = this.putObject(repo, 'commit', commitData);
     this.setBranch(repo, branch, commitSha);
+    repo.seq = this.seq;
     return { commitSha, blobSha };
   }
 

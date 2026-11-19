@@ -57,7 +57,7 @@ export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
     private: repo.private,
     description: repo.description,
     default_branch: repo.defaultBranch,
-    created_at: isoOfSeq(1),
+    created_at: isoOfSeq(0),
     updated_at: isoOfSeq(repo.seq),
     pushed_at: isoOfSeq(repo.seq),
     language: null,
@@ -209,6 +209,7 @@ export function doSquashMerge(store: Store, repo: Repo, pr: Pull): { sha: string
   const sha = oidOf('commit', commitData);
   store.putObject(repo, 'commit', commitData);
   store.setBranch(repo, pr.baseRef, sha);
+  repo.seq = store.seq;
   pr.state = 'closed';
   pr.merged = true;
   pr.mergedAt = store.isoNow();
@@ -527,7 +528,9 @@ function handleContents(store: Store, repo: Repo, ctx: RestCtx, pathSegs: string
     if (invalid) return err(400, 'Malformed JSON body');
     const contentB64 = str(body?.content);
     if (contentB64 === '') return err(422, 'content is required');
-    const branch = str(body?.branch, ref);
+    // Branch may arrive as a body field (real GitHub API) or as a query
+    // parameter (?branch= / ?ref=); body wins.
+    const branch = str(body?.branch) || ctx.query.get('branch') || ref;
     const bytes = b64decode(contentB64);
     const message = str(body?.message, 'update');
     const branchTip = store.branchTip(repo, branch);
@@ -555,7 +558,7 @@ function handleContents(store: Store, repo: Repo, ctx: RestCtx, pathSegs: string
   if (m === 'DELETE') {
     const { value: body, invalid } = parseBody(ctx);
     if (invalid) return err(400, 'Malformed JSON body');
-    const branch = str(body?.branch, ref);
+    const branch = str(body?.branch) || ctx.query.get('branch') || ref;
     const branchTip = store.branchTip(repo, branch);
     if (branchTip === undefined) return err(404, 'Not Found');
     const tipObj = repo.objects.get(branchTip);
@@ -709,6 +712,11 @@ function handlePulls(store: Store, repo: Repo, ctx: RestCtx, rest: string[]): Re
   if (rest[1] === 'files' && m === 'GET') {
     if (pr === undefined) return err(404, 'Not Found');
     return ok(200, pullFiles(store, repo, pr));
+  }
+  if (rest[1] === 'merge' && m === 'GET') {
+    if (pr === undefined) return err(404, 'Not Found');
+    if (pr.merged) return { status: 204, json: null };
+    return err(404, 'Not Found');
   }
   if (rest[1] === 'merge' && m === 'PUT') {
     if (pr === undefined) return err(404, 'Not Found');
