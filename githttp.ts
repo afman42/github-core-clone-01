@@ -291,11 +291,9 @@ function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
     for (const u of plan.unshallow) parts.push(pkt(`unshallow ${u}\n`));
     parts.push(PKT_DELIM);
   }
-  if (plan.wantedRefs.length > 0) {
-    parts.push(pkt('wanted-refs\n'));
-    for (const [oid, ref] of plan.wantedRefs) parts.push(pkt(`${oid} ${ref}\n`));
-    parts.push(PKT_DELIM);
-  }
+  // Note: no `wanted-refs` section. Git's client only consumes it after a
+  // `want-ref` request, and sending it after plain `want` oids makes real
+  // git reject the response ("expected 'packfile'").
   parts.push(pkt('packfile\n'));
   parts.push(...sidebandPackets(pack));
   parts.push(PKT_FLUSH);
