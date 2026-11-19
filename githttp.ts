@@ -58,18 +58,14 @@ function lookupRepo(store: Store, owner: string, name: string): Repo | null {
 function refLinesV0(repo: Repo, caps: string): Buffer[] {
   const refs = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
   const parts: Buffer[] = [];
-  if (refs.length === 0) {
-    parts.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-    return parts;
-  }
-  let first = true;
+  // v0: the FIRST line is HEAD carrying the capabilities (this is how real
+  // git servers advertise; git's v0 client resolves the remote HEAD from
+  // this line, not from a symref capability). The branch/tag lines follow.
+  const headRef = `refs/heads/${repo.defaultBranch}`;
+  const headTip = repo.refs.get(headRef);
+  parts.push(pkt(`${headTip ?? ZERO_OID} HEAD\0${caps}\n`));
   for (const [ref, oid] of refs) {
-    if (first) {
-      parts.push(pkt(`${oid} ${ref}\0${caps}\n`));
-      first = false;
-    } else {
-      parts.push(pkt(`${oid} ${ref}\n`));
-    }
+    parts.push(pkt(`${oid} ${ref}\n`));
     // Peeled annotated tags, right after their base line.
     const obj = repo.objects.get(oid);
     if (obj !== undefined && obj.type === 'tag') {
@@ -99,7 +95,7 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
       ]);
       return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
     }
-    const caps = 'side-band-64k thin-pack ofs-delta multi_ack_detailed shallow object-format=sha1 ' +
+    const caps = 'multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-done object-format=sha1 ' +
       `symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`;
     const body = Buffer.concat([
       pkt('# service=git-upload-pack\n'),

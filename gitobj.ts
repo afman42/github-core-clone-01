@@ -172,6 +172,30 @@ export function isAncestor(store: ObjectStore, ancestor: string, tip: string): b
 }
 
 /**
+ * Best common ancestor of two commits: the common commit minimizing the
+ * maximum distance from either tip (exact for linear histories; a good
+ * approximation for criss-cross merges). Null when the histories share
+ * nothing. This is the correct three-way merge base — the base branch tip
+ * at PR creation is NOT (the base may have moved since).
+ */
+export function mergeBase(store: ObjectStore, a: string, b: string): string | null {
+  const distA = commitDistances(store, [a]);
+  const distB = commitDistances(store, [b]);
+  let best: string | null = null;
+  let bestScore = Infinity;
+  for (const [oid, da] of distA) {
+    const db = distB.get(oid);
+    if (db === undefined) continue;
+    const score = Math.max(da, db);
+    if (score < bestScore) {
+      bestScore = score;
+      best = oid;
+    }
+  }
+  return best;
+}
+
+/**
  * Commits reachable from `tip`, with BFS distance (generations) from the tip.
  * Used for depth-limited fetches: distance 0 is the tip itself.
  */

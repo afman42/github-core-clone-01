@@ -1,7 +1,7 @@
 // rest.ts — GitHub REST v3 under /api/v3. All routes from the REST spec:
 // repos CRUD + pagination, branches, commits, contents, labels, issues +
 // comments, pulls + files + squash merge, git/refs, meta, user.
-import { buildCommit, oidOf, parseCommit } from './gitobj.ts';
+import { buildCommit, mergeBase, oidOf, parseCommit } from './gitobj.ts';
 import type { Issue, Pull, Repo, Store } from './store.ts';
 import { b64decode, b64encode, isOid } from './util.ts';
 
@@ -157,14 +157,24 @@ function countLines(bytes: Buffer): number {
   return text.endsWith('\n') ? parts.length - 1 : parts.length;
 }
 
+/** Files of the three-way merge base (best common ancestor of the two tips). */
+function mergeBaseFiles(store: Store, repo: Repo, pr: Pull): Map<string, Buffer> {
+  const baseTip = store.branchTip(repo, pr.baseRef);
+  const headTip = store.branchTip(repo, pr.headRef);
+  if (baseTip === undefined || headTip === undefined) return new Map();
+  const mb = mergeBase(repo.objects, headTip, baseTip);
+  if (mb === null) return new Map();
+  const mbObj = repo.objects.get(mb);
+  if (mbObj === undefined || mbObj.type !== 'commit') return new Map();
+  return store.flattenTree(repo, parseCommit(mbObj.data).tree);
+}
+
 /** True when a three-way merge of this PR would conflict. */
 export function mergeConflicts(store: Store, repo: Repo, pr: Pull): boolean {
   const baseTip = store.branchTip(repo, pr.baseRef);
   const headTip = store.branchTip(repo, pr.headRef);
   if (baseTip === undefined || headTip === undefined) return false;
-  const baseObj = repo.objects.get(pr.baseTreeOid);
-  if (baseObj === undefined) return false;
-  const baseFiles = store.flattenTree(repo, pr.baseTreeOid);
+  const baseFiles = mergeBaseFiles(store, repo, pr);
   const headObj = repo.objects.get(headTip);
   if (headObj === undefined || headObj.type !== 'commit') return false;
   const headFiles = store.flattenTree(repo, parseCommit(headObj.data).tree);
@@ -189,7 +199,7 @@ export function doSquashMerge(store: Store, repo: Repo, pr: Pull): { sha: string
   if (mergeConflicts(store, repo, pr)) return null;
   const baseTip = store.branchTip(repo, pr.baseRef) as string;
   const headTip = store.branchTip(repo, pr.headRef) as string;
-  const baseFiles = store.flattenTree(repo, pr.baseTreeOid);
+  const baseFiles = mergeBaseFiles(store, repo, pr);
   const headObj = repo.objects.get(headTip) as { type: string; data: Buffer };
   const headFiles = store.flattenTree(repo, parseCommit(headObj.data).tree);
   const curObj = repo.objects.get(baseTip) as { type: string; data: Buffer };
@@ -423,7 +433,8 @@ export function handleRest(store: Store, ctx: RestCtx): RestRes {
     return handleContents(store, repo, ctx, rest.slice(1));
   }
 
-  if (sub === 'git' && rest[1] === 'refs') {
+  if (sub === 'git' && (rest[1] === 'refs' || rest[1] === 'ref')) {
+    if (rest[1] === 'ref' && m !== 'GET') return err(404, 'Not Found');
     if (m === 'POST' && rest.length === 2) {
       const { value: body, invalid } = parseBody(ctx);
       if (invalid) return err(400, 'Malformed JSON body');
