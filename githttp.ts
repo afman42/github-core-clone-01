@@ -95,7 +95,7 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
       ]);
       return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
     }
-    const caps = 'multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-done object-format=sha1 ' +
+    const caps = 'multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow no-done object-format=sha1 ' +
       `symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`;
     const body = Buffer.concat([
       pkt('# service=git-upload-pack\n'),
